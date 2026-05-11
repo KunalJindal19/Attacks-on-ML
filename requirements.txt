@@ -1,0 +1,11 @@
+# Core ML / data science
+numpy>=1.26,<2.1
+pandas>=2.0,<2.3
+scikit-learn>=1.3,<1.6
+Pillow>=10.0
+tqdm>=4.65
+
+# PyTorch — install the CUDA 12.x wheel on GPU machines
+# On a local Mac (CPU only), pip will pick the CPU wheel automatically
+torch>=2.1,<2.5
+torchvision>=0.16,<0.20
