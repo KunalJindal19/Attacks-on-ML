@@ -5,7 +5,7 @@ scikit-learn>=1.3,<1.6
 Pillow>=10.0
 tqdm>=4.65
 
-# PyTorch — install the CUDA 12.x wheel on GPU machines
-# On a local Mac (CPU only), pip will pick the CPU wheel automatically
+# PyTorch — install the CUDA 12.6 wheel on GPU machines
+--extra-index-url https://download.pytorch.org/whl/cu126
 torch>=2.1,<2.5
 torchvision>=0.16,<0.20
