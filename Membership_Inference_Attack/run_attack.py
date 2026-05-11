@@ -1,23 +1,34 @@
 """
 run_attack.py
 =============
-Membership Inference Attack on the NIH Chest X-ray victim model.
+Membership Inference Attack on the NIH Chest X-ray victim models.
 
-Runs two attack variants:
-  1. Baseline Shadow Model MIA
-  2. Variance-Enhanced Shadow Model MIA
+Runs BOTH attacks (Baseline + Variance-Enhanced) against BOTH victim models
+(overfit + regularized), producing a 4-row comparison table:
+
+  ┌──────────────────────────────────────┬─────────┬──────────────────────────────┐
+  │ Victim model                         │ Attack  │  Acc   Prec   Rec    F1      │
+  ├──────────────────────────────────────┼─────────┼──────────────────────────────┤
+  │ Overfitted (no regularisation)       │ Baseline│  ...   ...    ...    ...     │
+  │ Overfitted (no regularisation)       │ Variance│  ...   ...    ...    ...     │
+  │ Regularised (Dropout + WD + Aug)     │ Baseline│  ...   ...    ...    ...     │
+  │ Regularised (Dropout + WD + Aug)     │ Variance│  ...   ...    ...    ...     │
+  └──────────────────────────────────────┴─────────┴──────────────────────────────┘
 
 Pre-conditions
 --------------
-  Victim_Model/manifest.csv      (run: python Victim_Model/prepare_dataset.py)
-  Victim_Model/victim.pth        (run: python Victim_Model/train_victim.py)
-  Victim_Model/victim_meta.json  (created automatically by train_victim.py)
+  Victim_Model/manifest.csv                (run: python Victim_Model/prepare_dataset.py)
+  Victim_Model/victim_overfit.pth          (run: python Victim_Model/train_victim.py)
+  Victim_Model/victim_regularized.pth      (run: python Victim_Model/train_victim.py --mode regularized)
 
 Usage
 -----
   python Membership_Inference_Attack/run_attack.py
+  python Membership_Inference_Attack/run_attack.py --victim overfit       # single model
+  python Membership_Inference_Attack/run_attack.py --victim regularized   # single model
 """
 
+import argparse
 import os
 import sys
 import json
@@ -25,31 +36,43 @@ import time
 import numpy as np
 import pandas as pd
 
-# ── Resolve paths so the script can be run from any working directory ─────────
+# ── Resolve paths ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 VICTIM_DIR   = os.path.join(PROJECT_ROOT, "Victim_Model")
 
-# Add Membership_Inference_Attack/ to path so mia.py / shadow_models.py resolve
-sys.path.insert(0, SCRIPT_DIR)
-# Add Victim_Model/ to path so api.py resolves
-sys.path.insert(0, VICTIM_DIR)
+sys.path.insert(0, SCRIPT_DIR)   # mia.py, mia_variance.py, shadow_models.py
+sys.path.insert(0, VICTIM_DIR)   # api.py
 
 MANIFEST_PATH = os.path.join(VICTIM_DIR, "manifest.csv")
-MODEL_PATH    = os.path.join(VICTIM_DIR, "victim.pth")
-META_PATH     = os.path.join(VICTIM_DIR, "victim_meta.json")
 RESULTS_PATH  = os.path.join(SCRIPT_DIR, "attack_results.txt")
 
-# ── Attack configuration (matches prompt recommendations) ────────────────────
+# ── Attack configuration ───────────────────────────────────────────────────────
 
 NUM_SHADOW_MODELS   = 8
 SHADOW_DATASET_SIZE = 2_500    # images per shadow model
-NUM_POOL_MEMBERS    = 3_000    # from member paths → attacker's pool
-NUM_POOL_NONMEMBERS = 3_000    # from non-member paths → attacker's pool
-NUM_EVAL_MEMBERS    = 2_000    # held-out for evaluation
+NUM_POOL_MEMBERS    = 3_000
+NUM_POOL_NONMEMBERS = 3_000
+NUM_EVAL_MEMBERS    = 2_000
 NUM_EVAL_NONMEMBERS = 2_000
 RANDOM_SEED         = 42
+
+# Victim model variants — order determines table row order
+VICTIM_VARIANTS = [
+    {
+        "key":        "overfit",
+        "label":      "Overfitted (no regularisation)",
+        "model_path": os.path.join(VICTIM_DIR, "victim_overfit.pth"),
+        "meta_path":  os.path.join(VICTIM_DIR, "victim_overfit_meta.json"),
+    },
+    {
+        "key":        "regularized",
+        "label":      "Regularised (Dropout + WD + Aug)",
+        "model_path": os.path.join(VICTIM_DIR, "victim_regularized.pth"),
+        "meta_path":  os.path.join(VICTIM_DIR, "victim_regularized_meta.json"),
+    },
+]
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,45 +86,97 @@ def print_banner(text: str):
 
 
 def load_manifest():
-    """Load manifest and return (member_paths, nonmember_paths) as np arrays."""
-    for path, label in [(MANIFEST_PATH, "manifest.csv"),
-                         (MODEL_PATH,    "victim.pth"),
-                         (META_PATH,     "victim_meta.json")]:
-        if not os.path.exists(path):
-            print(f"ERROR: {path} not found. Run the prerequisite script first.")
-            sys.exit(1)
+    if not os.path.exists(MANIFEST_PATH):
+        print(f"ERROR: {MANIFEST_PATH} not found. Run prepare_dataset.py first.")
+        sys.exit(1)
 
     df = pd.read_csv(MANIFEST_PATH)
     member_paths    = df[df["split"] == "member"]["path"].values
     nonmember_paths = df[df["split"] == "nonmember"]["path"].values
-
     print(f"[DATA] Members:     {len(member_paths)}", flush=True)
     print(f"[DATA] Non-members: {len(nonmember_paths)}", flush=True)
     return member_paths, nonmember_paths
 
 
-# ─── Attack 1: Baseline Shadow MIA ────────────────────────────────────────────
+def build_pool_and_eval(member_paths_all, nonmember_paths_all):
+    """Return (pool_all, eval_member_paths, eval_nonmember_paths)."""
+    rng = np.random.RandomState(RANDOM_SEED)
+
+    max_pool_m  = int(len(member_paths_all)    * 0.66)
+    max_pool_nm = int(len(nonmember_paths_all) * 0.66)
+    n_pool_m    = min(NUM_POOL_MEMBERS,    max_pool_m)
+    n_pool_nm   = min(NUM_POOL_NONMEMBERS, max_pool_nm)
+
+    member_idx    = rng.permutation(len(member_paths_all))
+    nonmember_idx = rng.permutation(len(nonmember_paths_all))
+
+    n_eval_m  = min(NUM_EVAL_MEMBERS,    len(member_paths_all)    - n_pool_m)
+    n_eval_nm = min(NUM_EVAL_NONMEMBERS, len(nonmember_paths_all) - n_pool_nm)
+
+    pool_member_paths    = member_paths_all[member_idx[:n_pool_m]]
+    pool_nonmember_paths = nonmember_paths_all[nonmember_idx[:n_pool_nm]]
+    eval_member_paths    = member_paths_all[member_idx[n_pool_m: n_pool_m + n_eval_m]]
+    eval_nonmember_paths = nonmember_paths_all[nonmember_idx[n_pool_nm: n_pool_nm + n_eval_nm]]
+
+    pool_all = np.concatenate([pool_member_paths, pool_nonmember_paths])
+    rng.shuffle(pool_all)
+
+    print(
+        f"\n[SETUP] Pool size:      {len(pool_all)} "
+        f"({n_pool_m} member + {n_pool_nm} nonmember, shuffled)"
+    )
+    print(f"[SETUP] Eval members:    {len(eval_member_paths)}")
+    print(f"[SETUP] Eval nonmembers: {len(eval_nonmember_paths)}")
+    sys.stdout.flush()
+
+    return pool_all, eval_member_paths, eval_nonmember_paths
+
+
+def confidence_gap_diagnostic(api, eval_member_paths, eval_nonmember_paths):
+    """Print and return the mean max-confidence gap between members and non-members."""
+    t0 = time.time()
+    member_scores    = api.predict(np.array(eval_member_paths,    dtype=object))
+    nonmember_scores = api.predict(np.array(eval_nonmember_paths, dtype=object))
+    print(
+        f"  {len(eval_member_paths) + len(eval_nonmember_paths)} eval images "
+        f"queried in {time.time() - t0:.1f}s",
+        flush=True,
+    )
+
+    member_conf    = np.max(member_scores,    axis=1).mean()
+    nonmember_conf = np.max(nonmember_scores, axis=1).mean()
+    gap            = member_conf - nonmember_conf
+
+    print(f"\n[DIAG] Mean max-confidence on members:     {member_conf:.4f}")
+    print(f"[DIAG] Mean max-confidence on non-members: {nonmember_conf:.4f}")
+    print(
+        f"[DIAG] Confidence gap (member - nonmember): {gap:+.4f}  "
+        f"(positive = MIA signal exists)"
+    )
+    sys.stdout.flush()
+
+    if gap < 0.05:
+        print(
+            "\n  WARNING: Confidence gap is very small. "
+            "The MIA signal may be weak for this victim.",
+            flush=True,
+        )
+    return gap
+
+
+# ─── Single-variant attack runners ────────────────────────────────────────────
 
 def run_baseline_attack(api, pool_paths, eval_member_paths,
                         eval_nonmember_paths, num_classes: int) -> dict:
     from mia import MIA, ModelParameters
 
-    print_banner("ATTACK 1: STANDARD SHADOW MODEL MIA (BASELINE)")
-
-    # Cycle through three lightweight CNN architectures for diversity
-    shadow_archs = ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     shadow_params = [
         ModelParameters(
-            "pytorch_cnn",
-            architecture=arch,
-            num_classes=num_classes,
-            epochs=15,
-            batch_size=32,
-            lr=1e-3,
+            "pytorch_cnn", architecture=arch, num_classes=num_classes,
+            epochs=15, batch_size=32, lr=1e-3,
         )
-        for arch in shadow_archs
+        for arch in ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     ]
-
     mia = MIA(
         victim_model_api=api,
         unlabelled_data=pool_paths,
@@ -115,47 +190,24 @@ def run_baseline_attack(api, pool_paths, eval_member_paths,
     )
     mia.execute()
 
-    print("\n[STEP 2] Evaluating on held-out data …", flush=True)
+    print("\n[EVAL] Evaluating on held-out data …", flush=True)
     metrics = mia.evaluate(eval_member_paths, eval_nonmember_paths)
+    _print_metrics("Baseline Shadow MIA", metrics)
+    return metrics
 
-    print(f"\n  Baseline Shadow MIA Results:")
-    print(f"    Accuracy:  {metrics['accuracy']:.4f}")
-    print(f"    Precision: {metrics['precision']:.4f}")
-    print(f"    Recall:    {metrics['recall']:.4f}")
-    print(f"    F1 Score:  {metrics['f1']:.4f}")
-    sys.stdout.flush()
-
-    return {
-        "Model":     "Baseline Shadow Model (Gradient Boosting)",
-        "Accuracy":  metrics["accuracy"],
-        "Precision": metrics["precision"],
-        "Recall":    metrics["recall"],
-        "F1":        metrics["f1"],
-    }
-
-
-# ─── Attack 2: Variance-Enhanced Shadow MIA ───────────────────────────────────
 
 def run_variance_attack(api, pool_paths, eval_member_paths,
                         eval_nonmember_paths, num_classes: int) -> dict:
     from mia_variance import VarianceMIA
     from mia import ModelParameters
 
-    print_banner("ATTACK 2: VARIANCE-ENHANCED SHADOW MODEL MIA")
-
-    shadow_archs = ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     shadow_params = [
         ModelParameters(
-            "pytorch_cnn",
-            architecture=arch,
-            num_classes=num_classes,
-            epochs=15,
-            batch_size=32,
-            lr=1e-3,
+            "pytorch_cnn", architecture=arch, num_classes=num_classes,
+            epochs=15, batch_size=32, lr=1e-3,
         )
-        for arch in shadow_archs
+        for arch in ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     ]
-
     vmia = VarianceMIA(
         victim_model_api=api,
         unlabelled_data=pool_paths,
@@ -169,192 +221,179 @@ def run_variance_attack(api, pool_paths, eval_member_paths,
     )
     vmia.execute()
 
-    # Quick peek at the attack dataset to verify variance feature
     print("\n  Attack dataset sample (first 3 rows):")
     print(vmia.attack_dataset.head(3).to_string(index=False))
-    sys.stdout.flush()
 
-    print("\n[STEP 2] Evaluating on held-out data …", flush=True)
+    print("\n[EVAL] Evaluating on held-out data …", flush=True)
     metrics = vmia.evaluate(eval_member_paths, eval_nonmember_paths)
+    _print_metrics("Variance-Enhanced MIA", metrics)
+    return metrics
 
-    print(f"\n  VarianceMIA Results:")
+
+def _print_metrics(label: str, metrics: dict):
+    print(f"\n  {label} Results:")
     print(f"    Accuracy:  {metrics['accuracy']:.4f}")
     print(f"    Precision: {metrics['precision']:.4f}")
     print(f"    Recall:    {metrics['recall']:.4f}")
     print(f"    F1 Score:  {metrics['f1']:.4f}")
     sys.stdout.flush()
 
-    return {
-        "Model":     "Variance Shadow Model (Gradient Boosting)",
-        "Accuracy":  metrics["accuracy"],
-        "Precision": metrics["precision"],
-        "Recall":    metrics["recall"],
-        "F1":        metrics["f1"],
-    }
+
+# ─── Per-victim experiment ─────────────────────────────────────────────────────
+
+def run_experiments_for_victim(variant: dict, pool_all, eval_member_paths,
+                               eval_nonmember_paths) -> list[dict]:
+    """Run both attacks against one victim model. Returns list of result dicts."""
+    from api import VictimAPI
+
+    model_path = variant["model_path"]
+    meta_path  = variant["meta_path"]
+    label      = variant["label"]
+
+    if not os.path.exists(model_path):
+        print(
+            f"\n  SKIPPING {label}: {model_path} not found. "
+            f"Run train_victim.py --mode {variant['key']} first.",
+            flush=True,
+        )
+        return []
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+
+    num_classes = int(meta["num_classes"])
+
+    print_banner(f"VICTIM: {label.upper()}")
+    print(f"  Architecture:    {meta.get('architecture', '?')}")
+    print(f"  train_acc:       {meta.get('final_train_acc', 0):.4f}")
+    print(f"  val_acc:         {meta.get('final_val_acc', 0):.4f}")
+    print(f"  Memorization gap:{meta.get('memorization_gap', 0) * 100:+.2f}%")
+    print(f"  Dropout:         {meta.get('dropout', False)}")
+    print(f"  Weight decay:    {meta.get('weight_decay', 0.0)}")
+    print(f"  Augmentation:    {meta.get('augmentation', False)}")
+    sys.stdout.flush()
+
+    api = VictimAPI(model_path, num_classes=num_classes, batch_size=32)
+    print(f"\n  Inference device: {api.device}", flush=True)
+
+    print("\n  Pre-computing confidence-gap diagnostic …", flush=True)
+    gap = confidence_gap_diagnostic(api, eval_member_paths, eval_nonmember_paths)
+
+    results = []
+
+    # --- Attack 1: Baseline ---
+    print_banner(f"[{label}] ATTACK 1: STANDARD SHADOW MODEL MIA")
+    t0       = time.time()
+    metrics1 = run_baseline_attack(api, pool_all, eval_member_paths,
+                                   eval_nonmember_paths, num_classes)
+    results.append({
+        "victim_label":  label,
+        "attack_label":  "Baseline (Gradient Boosting)",
+        "conf_gap":      gap,
+        **metrics1,
+    })
+    print(f"  Runtime: {time.time() - t0:.1f}s", flush=True)
+
+    # --- Attack 2: Variance ---
+    print_banner(f"[{label}] ATTACK 2: VARIANCE-ENHANCED SHADOW MIA")
+    t0       = time.time()
+    metrics2 = run_variance_attack(api, pool_all, eval_member_paths,
+                                   eval_nonmember_paths, num_classes)
+    results.append({
+        "victim_label":  label,
+        "attack_label":  "Variance-Enhanced (Gradient Boosting)",
+        "conf_gap":      gap,
+        **metrics2,
+    })
+    print(f"  Runtime: {time.time() - t0:.1f}s", flush=True)
+
+    return results
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print_banner("Shadow Model MIA on NIH Chest X-ray Victim Model")
+    parser = argparse.ArgumentParser(
+        description="Run MIA against overfitted and/or regularized victim models"
+    )
+    parser.add_argument(
+        "--victim", type=str, default="both",
+        choices=["both", "overfit", "regularized"],
+        help="Which victim model(s) to attack. Default: both",
+    )
+    args = parser.parse_args()
 
-    # 1. Load manifest
+    print_banner("Shadow Model MIA — NIH Chest X-ray")
+
+    # 1. Load manifest (shared by both victims)
     print("\n[SETUP] Loading manifest …", flush=True)
     member_paths_all, nonmember_paths_all = load_manifest()
 
-    # 2. Load victim metadata
-    with open(META_PATH, "r") as f:
-        meta = json.load(f)
-
-    num_classes = int(meta["num_classes"])
-    print(f"[SETUP] Architecture:  {meta.get('architecture', 'unknown')}")
-    print(f"[SETUP] Num classes:   {num_classes}")
-    print(f"[SETUP] Label names:   {meta.get('label_names', [])}")
-    print(
-        f"[SETUP] Victim  train_acc={meta.get('final_train_acc', 0):.4f}  "
-        f"val_acc={meta.get('final_val_acc', 0):.4f}  "
-        f"gap={(meta.get('memorization_gap', 0)) * 100:+.2f}%"
-    )
-    sys.stdout.flush()
-
-    # 3. Build pool (attacker's view: mixed members + non-members, shuffled)
-    #    and held-out eval set (we know ground truth for measuring attack perf)
-    rng = np.random.RandomState(RANDOM_SEED)
-
-    # Cap pool size to at most 66% of available paths, leave rest for eval
-    max_pool_m  = int(len(member_paths_all)    * 0.66)
-    max_pool_nm = int(len(nonmember_paths_all) * 0.66)
-    n_pool_m    = min(NUM_POOL_MEMBERS,    max_pool_m)
-    n_pool_nm   = min(NUM_POOL_NONMEMBERS, max_pool_nm)
-
-    member_idx    = rng.permutation(len(member_paths_all))
-    nonmember_idx = rng.permutation(len(nonmember_paths_all))
-
-    pool_m_idx  = member_idx[:n_pool_m]
-    pool_nm_idx = nonmember_idx[:n_pool_nm]
-
-    n_eval_m  = min(NUM_EVAL_MEMBERS,    len(member_paths_all)    - n_pool_m)
-    n_eval_nm = min(NUM_EVAL_NONMEMBERS, len(nonmember_paths_all) - n_pool_nm)
-    eval_m_idx  = member_idx[n_pool_m: n_pool_m + n_eval_m]
-    eval_nm_idx = nonmember_idx[n_pool_nm: n_pool_nm + n_eval_nm]
-
-    pool_member_paths    = member_paths_all[pool_m_idx]
-    pool_nonmember_paths = nonmember_paths_all[pool_nm_idx]
-    eval_member_paths    = member_paths_all[eval_m_idx]
-    eval_nonmember_paths = nonmember_paths_all[eval_nm_idx]
-
-    # Attacker's pool: mix and shuffle so membership is unknown
-    pool_all = np.concatenate([pool_member_paths, pool_nonmember_paths])
-    rng.shuffle(pool_all)
-
-    print(
-        f"\n[SETUP] Pool size:      {len(pool_all)} "
-        f"({n_pool_m} member + {n_pool_nm} nonmember, shuffled)"
-    )
-    print(f"[SETUP] Eval members:    {len(eval_member_paths)}")
-    print(f"[SETUP] Eval nonmembers: {len(eval_nonmember_paths)}")
-    sys.stdout.flush()
-
-    # 4. Load victim API
-    print(f"\n[SETUP] Loading victim model …", flush=True)
-    from api import VictimAPI
-    api = VictimAPI(MODEL_PATH, num_classes=num_classes, batch_size=32)
-    print(f"[SETUP] Inference device: {api.device}", flush=True)
-
-    # 5. Pre-compute victim scores on eval set for the confidence-gap diagnostic
-    print(
-        "\n[SETUP] Pre-computing victim confidence scores on eval set …",
-        flush=True,
-    )
-    t0 = time.time()
-    eval_member_scores    = api.predict(np.array(eval_member_paths,    dtype=object))
-    eval_nonmember_scores = api.predict(np.array(eval_nonmember_paths, dtype=object))
-    print(
-        f"  {len(eval_member_paths) + len(eval_nonmember_paths)} eval images "
-        f"queried in {time.time() - t0:.1f}s",
-        flush=True,
+    # 2. Build shared pool + eval split (same random seed → fair comparison)
+    pool_all, eval_member_paths, eval_nonmember_paths = build_pool_and_eval(
+        member_paths_all, nonmember_paths_all
     )
 
-    # ── Confidence-gap diagnostic (uses ALL eval samples, not just first 50) ──
-    member_max_conf    = np.max(eval_member_scores,    axis=1).mean()
-    nonmember_max_conf = np.max(eval_nonmember_scores, axis=1).mean()
+    # 3. Determine which victims to run
+    if args.victim == "both":
+        variants = VICTIM_VARIANTS
+    else:
+        variants = [v for v in VICTIM_VARIANTS if v["key"] == args.victim]
 
-    print(f"\n[DIAG] Mean max-confidence on members:     {member_max_conf:.4f}")
-    print(f"[DIAG] Mean max-confidence on non-members: {nonmember_max_conf:.4f}")
-    print(
-        f"[DIAG] Confidence gap (member - nonmember): "
-        f"{member_max_conf - nonmember_max_conf:+.4f}  "
-        f"(positive = MIA signal exists)"
-    )
-    sys.stdout.flush()
+    # 4. Run experiments
+    grand_start  = time.time()
+    all_results  = []
 
-    if member_max_conf - nonmember_max_conf < 0.05:
-        print(
-            "\n  WARNING: Confidence gap is very small. "
-            "The victim model may not be sufficiently overfitted. "
-            "Check memorization_gap in victim_meta.json.",
-            flush=True,
+    for variant in variants:
+        results = run_experiments_for_victim(
+            variant, pool_all, eval_member_paths, eval_nonmember_paths
         )
+        all_results.extend(results)
 
-    # 6. Run both attacks
-    total_start = time.time()
+    total_time = time.time() - grand_start
 
-    baseline_result = run_baseline_attack(
-        api, pool_all, eval_member_paths, eval_nonmember_paths, num_classes
+    if not all_results:
+        print("\nNo results — did you train the victim models first?", flush=True)
+        return
+
+    # 5. Final comparison table
+    print_banner("FINAL COMPARISON TABLE")
+
+    VL = 34   # victim label width
+    AL = 38   # attack label width
+
+    header = (
+        f"\n  {'Victim Model':<{VL}}  {'Attack':<{AL}}  "
+        f"{'Gap':>6}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}"
     )
-    variance_result = run_variance_attack(
-        api, pool_all, eval_member_paths, eval_nonmember_paths, num_classes
-    )
+    print(header)
+    print("  " + "-" * (VL + AL + 50))
 
-    total_time = time.time() - total_start
-
-    # 7. Final comparison table
-    print_banner("FINAL COMPARISON: BASELINE vs VARIANCE-ENHANCED MIA")
-
-    all_results = [baseline_result, variance_result]
-    print(
-        f"\n  {'Attack Method':<45s}  {'Acc':>7s}  {'Prec':>7s}  "
-        f"{'Rec':>7s}  {'F1':>7s}"
-    )
-    print("  " + "-" * 75)
     for r in all_results:
         print(
-            f"  {r['Model']:<45s}  {r['Accuracy']:7.4f}  "
-            f"{r['Precision']:7.4f}  {r['Recall']:7.4f}  {r['F1']:7.4f}"
+            f"  {r['victim_label']:<{VL}}  {r['attack_label']:<{AL}}  "
+            f"{r['conf_gap']:+6.4f}  {r['accuracy']:7.4f}  "
+            f"{r['precision']:7.4f}  {r['recall']:7.4f}  {r['f1']:7.4f}"
         )
 
-    print(f"\n  Random baseline:      0.5000")
-    print(f"  Total attack runtime: {total_time:.1f}s")
+    print(f"\n  Random baseline: 0.5000")
+    print(f"  Total runtime:   {total_time:.1f}s")
     sys.stdout.flush()
 
-    # 8. Save results to text file
+    # 6. Save to file
     with open(RESULTS_PATH, "w") as f:
-        f.write("NIH Chest X-ray — Shadow Model MIA Results\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Victim architecture:  {meta.get('architecture', 'unknown')}\n")
-        f.write(f"Num classes:          {num_classes}\n")
-        f.write(f"Label names:          {meta.get('label_names', [])}\n")
-        f.write(f"Victim train_acc:     {meta.get('final_train_acc', 0):.4f}\n")
-        f.write(f"Victim val_acc:       {meta.get('final_val_acc', 0):.4f}\n")
+        f.write("NIH Chest X-ray — MIA Results (Overfit vs Regularized)\n")
+        f.write("=" * 75 + "\n\n")
         f.write(
-            f"Memorization gap:     "
-            f"{meta.get('memorization_gap', 0) * 100:+.2f}%\n"
+            f"  {'Victim Model':<{VL}}  {'Attack':<{AL}}  "
+            f"{'Gap':>6}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}\n"
         )
-        f.write(f"Confidence gap:       {member_max_conf - nonmember_max_conf:+.4f}\n")
-        f.write(f"Shadow models:        {NUM_SHADOW_MODELS}\n")
-        f.write(f"Shadow dataset size:  {SHADOW_DATASET_SIZE} / model\n")
-        f.write(f"Pool size:            {len(pool_all)}\n")
-        f.write(f"Eval size:            {len(eval_member_paths) + len(eval_nonmember_paths)}\n\n")
-
-        f.write(
-            f"{'Attack Method':<45s}  {'Acc':>7s}  {'Prec':>7s}  "
-            f"{'Rec':>7s}  {'F1':>7s}\n"
-        )
-        f.write("-" * 75 + "\n")
+        f.write("  " + "-" * (VL + AL + 50) + "\n")
         for r in all_results:
             f.write(
-                f"{r['Model']:<45s}  {r['Accuracy']:7.4f}  "
-                f"{r['Precision']:7.4f}  {r['Recall']:7.4f}  {r['F1']:7.4f}\n"
+                f"  {r['victim_label']:<{VL}}  {r['attack_label']:<{AL}}  "
+                f"{r['conf_gap']:+6.4f}  {r['accuracy']:7.4f}  "
+                f"{r['precision']:7.4f}  {r['recall']:7.4f}  {r['f1']:7.4f}\n"
             )
         f.write(f"\nRandom baseline: 0.5000\n")
         f.write(f"Total runtime:   {total_time:.1f}s\n")

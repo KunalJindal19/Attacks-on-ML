@@ -4,13 +4,19 @@ train_victim.py
 Train a DenseNet-121 victim model on the MEMBER-ONLY portion of the NIH
 Chest X-ray dataset.
 
-Design choices to encourage intentional overfitting (for MIA signal):
-  ✓ Full fine-tune: all layers trainable
-  ✓ Pretrained on ImageNet (pretrained=True)
-  ✓ NO dropout, NO weight decay, NO data augmentation
-  ✓ Loss: BCEWithLogitsLoss (multi-label)
-  ✓ Optimizer: Adam, lr=1e-4
-  ✓ 30 epochs → expect train_acc > 99%, val_acc ~93%, gap ~6%
+Two training modes controlled by --mode:
+
+  overfit (default)
+    ✓ No dropout, no weight decay, no data augmentation
+    ✓ 30 epochs → train_acc ~99%, val_acc ~93%, gap ~6%
+    ✓ Saved as: victim_overfit.pth / victim_overfit_meta.json
+
+  regularized
+    ✓ Dropout(0.3) in classifier head
+    ✓ weight_decay = 1e-4
+    ✓ Data augmentation: random horizontal flip + random crop
+    ✓ 30 epochs → smaller gap, better generalisation
+    ✓ Saved as: victim_regularized.pth / victim_regularized_meta.json
 
 Inputs
 ------
@@ -18,12 +24,14 @@ Inputs
 
 Outputs
 -------
-  Victim_Model/victim.pth          ← model weights (state_dict)
-  Victim_Model/victim_meta.json    ← architecture info + final metrics
+  Victim_Model/victim_{mode}.pth
+  Victim_Model/victim_{mode}_meta.json
 
 Usage
 -----
-  python train_victim.py [--epochs N] [--batch_size B] [--lr LR] [--arch ARCH]
+  python train_victim.py                          # overfit (default)
+  python train_victim.py --mode regularized       # regularized
+  python train_victim.py --mode overfit --epochs 40 --arch resnet50
 """
 
 import os
@@ -46,8 +54,7 @@ from PIL import Image
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.csv")
-MODEL_PATH    = os.path.join(BASE_DIR, "victim.pth")
-META_PATH     = os.path.join(BASE_DIR, "victim_meta.json")
+# Output paths are constructed dynamically from --mode: victim_{mode}.pth
 
 DISEASE_CLASSES = [
     "Atelectasis", "Consolidation", "Infiltration", "Pneumothorax", "Edema",
@@ -98,49 +105,65 @@ class NIHDataset(Dataset):
         return img, torch.tensor(label_list, dtype=torch.float32)
 
 
-# ─── Model ────────────────────────────────────────────────────────────────────
+# ─── Model builders ───────────────────────────────────────────────────────────
 
-def build_model(architecture: str, num_classes: int) -> nn.Module:
-    """Build a pretrained model with a custom multi-label head.
-
-    Currently supported: densenet121 (default), resnet50, efficientnet_b3.
-    Head: Linear(in_features, 512) → ReLU → Linear(512, num_classes)
-    No dropout, no weight_decay — intentional for overfitting.
-    """
+def _get_backbone(architecture: str) -> tuple["nn.Module", int]:
+    """Return (backbone, in_features) for the given architecture string."""
     arch = architecture.lower()
-
     if arch == "densenet121":
         model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-        in_f  = model.classifier.in_features
-        model.classifier = nn.Sequential(
-            nn.Linear(in_f, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_classes),
-        )
-
+        return model, model.classifier.in_features
     elif arch == "resnet50":
         model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        in_f  = model.fc.in_features
-        model.fc = nn.Sequential(
-            nn.Linear(in_f, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_classes),
-        )
-
+        return model, model.fc.in_features
     elif arch == "efficientnet_b3":
         model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.IMAGENET1K_V1)
-        in_f  = model.classifier[1].in_features
-        model.classifier = nn.Sequential(
-            nn.Linear(in_f, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_classes),
-        )
-
+        return model, model.classifier[1].in_features
     else:
         raise ValueError(
             f"Unsupported architecture: '{architecture}'. "
             "Choose from: densenet121, resnet50, efficientnet_b3"
         )
+
+
+def build_model(architecture: str, num_classes: int, regularized: bool = False) -> nn.Module:
+    """Build a pretrained model with a custom multi-label head.
+
+    Parameters
+    ----------
+    architecture : str
+        'densenet121', 'resnet50', or 'efficientnet_b3'.
+    num_classes : int
+        Number of output labels.
+    regularized : bool
+        If True, adds Dropout(0.3) to the classifier head.
+        The caller is responsible for also passing weight_decay to the optimizer.
+    """
+    arch  = architecture.lower()
+    model, in_f = _get_backbone(architecture)
+
+    if regularized:
+        # Head WITH dropout — intentionally reduces overfitting
+        head = nn.Sequential(
+            nn.Linear(in_f, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(512, num_classes),
+        )
+    else:
+        # Head WITHOUT dropout — intentionally maximises overfitting
+        head = nn.Sequential(
+            nn.Linear(in_f, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_classes),
+        )
+
+    if arch == "densenet121":
+        model.classifier = head
+    elif arch == "resnet50":
+        model.fc = head
+    elif arch == "efficientnet_b3":
+        model.classifier = head
 
     # Full fine-tune — all layers trainable
     for p in model.parameters():
@@ -185,7 +208,19 @@ def main():
         "--arch", type=str, default="densenet121",
         help="Model architecture: densenet121 | resnet50 | efficientnet_b3"
     )
+    parser.add_argument(
+        "--mode", type=str, default="overfit",
+        choices=["overfit", "regularized"],
+        help="Training mode: 'overfit' (no regularization) or 'regularized' "
+             "(Dropout + weight_decay + augmentation). Default: overfit"
+    )
     args = parser.parse_args()
+
+    is_regularized = args.mode == "regularized"
+
+    # Derive output paths from mode so both models coexist
+    model_path = os.path.join(BASE_DIR, f"victim_{args.mode}.pth")
+    meta_path  = os.path.join(BASE_DIR, f"victim_{args.mode}_meta.json")
 
     # Reproducibility
     torch.manual_seed(RANDOM_SEED)
@@ -195,7 +230,9 @@ def main():
     print(f"[INFO] Device:       {device}")
     if device.type == "cuda":
         print(f"[INFO] GPU:          {torch.cuda.get_device_name(0)}")
+    print(f"[INFO] Mode:         {args.mode}")
     print(f"[INFO] Architecture: {args.arch}")
+    print(f"[INFO] Output model: {model_path}")
     sys.stdout.flush()
 
     # ── Load manifest, keep only members ──────────────────────────────────────
@@ -226,8 +263,23 @@ def main():
     sys.stdout.flush()
 
     pin = device.type == "cuda"
-    train_ds     = NIHDataset(train_df)
-    val_ds       = NIHDataset(val_df)
+
+    # Regularized mode uses augmented training transform; val always uses plain resize
+    if is_regularized:
+        train_transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE + 20, IMG_SIZE + 20)),
+            transforms.RandomCrop(IMG_SIZE),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+        print("[INFO] Using augmented training transform (regularized mode).")
+    else:
+        train_transform = None   # NIHDataset default (plain resize)
+
+    train_ds     = NIHDataset(train_df, transform=train_transform)
+    val_ds       = NIHDataset(val_df)                             # always plain
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=pin,
@@ -238,9 +290,16 @@ def main():
     )
 
     # ── Model, optimizer, criterion ───────────────────────────────────────────
-    model     = build_model(args.arch, num_classes).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
-    criterion = nn.BCEWithLogitsLoss()
+    weight_decay = 1e-4 if is_regularized else 0.0
+    model        = build_model(args.arch, num_classes, regularized=is_regularized).to(device)
+    optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=weight_decay)
+    criterion    = nn.BCEWithLogitsLoss()
+
+    if is_regularized:
+        print(f"[INFO] Regularisation: Dropout(0.3) + weight_decay={weight_decay} + augmentation")
+    else:
+        print("[INFO] Regularisation: NONE (intentional overfitting)")
+    sys.stdout.flush()
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print("\n[TRAIN] Starting training …", flush=True)
@@ -287,43 +346,53 @@ def main():
         sys.stdout.flush()
 
     # ── Save model + metadata ─────────────────────────────────────────────────
-    torch.save(model.state_dict(), MODEL_PATH)
+    torch.save(model.state_dict(), model_path)
 
-    final_train_acc = history["train_acc"][-1]
-    final_val_acc   = history["val_acc"][-1]
+    final_train_acc  = history["train_acc"][-1]
+    final_val_acc    = history["val_acc"][-1]
     memorization_gap = final_train_acc - final_val_acc
 
     meta = {
-        "architecture":    args.arch,
-        "num_classes":     num_classes,
-        "label_names":     label_names,
-        "img_size":        IMG_SIZE,
-        "imagenet_mean":   IMAGENET_MEAN,
-        "imagenet_std":    IMAGENET_STD,
-        "final_train_acc": final_train_acc,
-        "final_val_acc":   final_val_acc,
+        "architecture":     args.arch,
+        "mode":             args.mode,
+        "num_classes":      num_classes,
+        "label_names":      label_names,
+        "img_size":         IMG_SIZE,
+        "imagenet_mean":    IMAGENET_MEAN,
+        "imagenet_std":     IMAGENET_STD,
+        "final_train_acc":  final_train_acc,
+        "final_val_acc":    final_val_acc,
         "memorization_gap": memorization_gap,
-        "epochs":          args.epochs,
-        "batch_size":      args.batch_size,
-        "learning_rate":   args.lr,
-        "weight_decay":    0.0,
-        "dropout":         False,
+        "epochs":           args.epochs,
+        "batch_size":       args.batch_size,
+        "learning_rate":    args.lr,
+        "weight_decay":     1e-4 if is_regularized else 0.0,
+        "dropout":          is_regularized,
+        "augmentation":     is_regularized,
     }
-    with open(META_PATH, "w") as f:
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
     print("\n[DONE]")
-    print(f"  Model:            {MODEL_PATH}")
-    print(f"  Metadata:         {META_PATH}")
+    print(f"  Mode:             {args.mode}")
+    print(f"  Model:            {model_path}")
+    print(f"  Metadata:         {meta_path}")
     print(f"  Final train_acc:  {final_train_acc:.4f}")
     print(f"  Final val_acc:    {final_val_acc:.4f}")
     print(f"  Memorization gap: {memorization_gap * 100:+.2f}%")
     sys.stdout.flush()
 
-    if memorization_gap < 0.05:
+    if args.mode == "overfit" and memorization_gap < 0.05:
         print(
-            "\n  WARNING: Memorization gap is <5%. The MIA signal may be weak. "
-            "Consider increasing --epochs or checking that no regularization is applied.",
+            "\n  WARNING: Memorization gap is <5% in overfit mode. "
+            "The MIA signal may be weak. Consider increasing --epochs.",
+            flush=True,
+        )
+    if args.mode == "regularized" and memorization_gap > 0.05:
+        print(
+            "\n  NOTE: Memorization gap >5% in regularized mode. "
+            "Try more epochs, stronger dropout, or larger weight_decay "
+            "if you want a tighter gap for cleaner comparison.",
             flush=True,
         )
 
