@@ -46,9 +46,9 @@ sys.path.insert(0, SCRIPT_DIR)   # mia.py, mia_variance.py, shadow_models.py
 sys.path.insert(0, VICTIM_DIR)   # api.py
 
 MANIFEST_PATH  = os.path.join(VICTIM_DIR, "manifest.csv")
-RESULTS_TXT    = os.path.join(SCRIPT_DIR, "attack_results.txt")
-RESULTS_JSON   = os.path.join(SCRIPT_DIR, "attack_results.json")
 LOGS_DIR       = os.path.join(SCRIPT_DIR, "logs")
+RESULTS_TXT    = os.path.join(LOGS_DIR, "attack_results.txt")
+RESULTS_JSON   = os.path.join(LOGS_DIR, "attack_results.json")
 
 # ── Attack configuration ───────────────────────────────────────────────────────
 # NOTE on attacker's data model:
