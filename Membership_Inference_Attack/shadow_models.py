@@ -102,7 +102,7 @@ class PyTorchShadowModel:
         self,
         architecture: str = "resnet18",
         num_classes: int = 15,
-        epochs: int = 15,
+        epochs: int = 25,       # increased from 15 — shadow models need more training
         batch_size: int = 32,
         lr: float = 1e-3,
         random_state: int = 42,
@@ -180,7 +180,7 @@ class PyTorchShadowModel:
         X : np.ndarray of str, shape (N,)
             Array of absolute file paths to images.
         y : np.ndarray of float32, shape (N, num_classes)
-            Multi-hot label matrix.
+            Multi-hot label matrix (pseudo-labels from victim API).
         """
         self.model = self._build_model()
         self.model.train()
@@ -197,10 +197,20 @@ class PyTorchShadowModel:
             pin_memory=pin_memory,
         )
 
+        # pos_weight: same class imbalance as victim — pseudo-labels from the
+        # victim API are sparse (most classes = 0 for most images).  Without
+        # pos_weight the shadow model collapses to all-zeros, which makes the
+        # attack dataset meaningless (members and non-members look identical).
+        pos_counts = y.sum(axis=0).clip(min=1)
+        neg_counts = len(y) - pos_counts
+        pw = np.clip(neg_counts / pos_counts, 0.1, 10.0)
+        pos_weight = torch.tensor(pw, dtype=torch.float32).to(self.device)
+
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.BCEWithLogitsLoss()
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         for epoch in range(self.epochs):
+            epoch_loss = 0.0
             for batch_idx, (images, labels) in enumerate(loader):
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
@@ -209,17 +219,18 @@ class PyTorchShadowModel:
                 logits = self.model(images)
                 loss   = criterion(logits, labels)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 optimizer.step()
+                epoch_loss += loss.item()
 
-                if batch_idx % 10 == 0:
-                    print(
-                        f"      [{self.architecture}] "
-                        f"Epoch {epoch + 1}/{self.epochs} | "
-                        f"Batch {batch_idx}/{len(loader)} | "
-                        f"Loss: {loss.item():.4f}",
-                        flush=True,
-                    )
-                    sys.stdout.flush()
+            avg_loss = epoch_loss / len(loader)
+            print(
+                f"      [{self.architecture}] "
+                f"Epoch {epoch + 1}/{self.epochs} | "
+                f"Avg Loss: {avg_loss:.4f}",
+                flush=True,
+            )
+            sys.stdout.flush()
 
         return self
 

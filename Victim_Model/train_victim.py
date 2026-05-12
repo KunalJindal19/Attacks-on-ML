@@ -26,6 +26,8 @@ Outputs
 -------
   Victim_Model/victim_{mode}.pth
   Victim_Model/victim_{mode}_meta.json
+  Victim_Model/logs/victim_{mode}_history.csv    ← per-epoch metrics
+  Victim_Model/logs/victim_{mode}_summary.txt    ← final summary
 
 Usage
 -----
@@ -37,6 +39,7 @@ Usage
 import os
 import sys
 import ast
+import csv
 import json
 import time
 import argparse
@@ -48,12 +51,14 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from PIL import Image
+from sklearn.metrics import roc_auc_score
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.csv")
+LOGS_DIR      = os.path.join(BASE_DIR, "logs")
 # Output paths are constructed dynamically from --mode: victim_{mode}.pth
 
 DISEASE_CLASSES = [
@@ -127,18 +132,7 @@ def _get_backbone(architecture: str) -> tuple["nn.Module", int]:
 
 
 def build_model(architecture: str, num_classes: int, regularized: bool = False) -> nn.Module:
-    """Build a pretrained model with a custom multi-label head.
-
-    Parameters
-    ----------
-    architecture : str
-        'densenet121', 'resnet50', or 'efficientnet_b3'.
-    num_classes : int
-        Number of output labels.
-    regularized : bool
-        If True, adds Dropout(0.3) to the classifier head.
-        The caller is responsible for also passing weight_decay to the optimizer.
-    """
+    """Build a pretrained model with a custom multi-label head."""
     arch  = architecture.lower()
     model, in_f = _get_backbone(architecture)
 
@@ -174,11 +168,29 @@ def build_model(architecture: str, num_classes: int, regularized: bool = False) 
 
 # ─── Eval ─────────────────────────────────────────────────────────────────────
 
-def evaluate(model, loader, device, num_classes) -> tuple[float, float]:
-    """Compute average loss and element-wise accuracy on a DataLoader."""
+def compute_pos_weight(train_df: pd.DataFrame, num_classes: int) -> torch.Tensor:
+    """Compute per-class pos_weight = (num_neg / num_pos) for BCEWithLogitsLoss.
+
+    This corrects for extreme class imbalance in the NIH dataset (e.g. 'No Finding'
+    is positive in ~56% of images while rare diseases are <3%). Without this, the
+    model collapses to predicting all-zero which looks like ~93% element-wise accuracy
+    but is clinically useless and gives near-zero MIA signal.
+    """
+    label_matrix = np.array(
+        [ast.literal_eval(row) for row in train_df["label_idx"]], dtype=np.float32
+    )
+    pos_counts = label_matrix.sum(axis=0)
+    neg_counts = len(label_matrix) - pos_counts
+    # Clip to avoid division by zero; cap ratio at 10 to avoid extreme gradients
+    pos_weight = np.clip(neg_counts / np.maximum(pos_counts, 1), 0.1, 10.0)
+    return torch.tensor(pos_weight, dtype=torch.float32)
+
+
+def evaluate(model, loader, device, num_classes, criterion) -> tuple[float, float, float]:
+    """Compute average loss, element-wise accuracy, and mean AUC-ROC on a DataLoader."""
     model.eval()
-    criterion = nn.BCEWithLogitsLoss()
     total_loss, total_correct, total_n = 0.0, 0, 0
+    all_labels, all_probs = [], []
 
     with torch.no_grad():
         for images, labels in loader:
@@ -188,13 +200,26 @@ def evaluate(model, loader, device, num_classes) -> tuple[float, float]:
             loss   = criterion(logits, labels)
             total_loss += loss.item() * images.size(0)
 
-            preds = (torch.sigmoid(logits) > 0.5).float()
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
             total_correct += (preds == labels).sum().item()
             total_n       += images.size(0) * num_classes
 
+            all_labels.append(labels.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+
     avg_loss = total_loss / (total_n / num_classes)
     accuracy = total_correct / total_n
-    return avg_loss, accuracy
+
+    # Mean AUC-ROC across classes (skip classes with no positive samples)
+    y_true = np.vstack(all_labels)
+    y_prob = np.vstack(all_probs)
+    try:
+        auc = roc_auc_score(y_true, y_prob, average="macro")
+    except ValueError:
+        auc = float("nan")
+
+    return avg_loss, accuracy, auc
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -219,8 +244,11 @@ def main():
     is_regularized = args.mode == "regularized"
 
     # Derive output paths from mode so both models coexist
-    model_path = os.path.join(BASE_DIR, f"victim_{args.mode}.pth")
-    meta_path  = os.path.join(BASE_DIR, f"victim_{args.mode}_meta.json")
+    model_path   = os.path.join(BASE_DIR, f"victim_{args.mode}.pth")
+    meta_path    = os.path.join(BASE_DIR, f"victim_{args.mode}_meta.json")
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_csv_path = os.path.join(LOGS_DIR, f"victim_{args.mode}_history.csv")
+    log_txt_path = os.path.join(LOGS_DIR, f"victim_{args.mode}_summary.txt")
 
     # Reproducibility
     torch.manual_seed(RANDOM_SEED)
@@ -254,7 +282,7 @@ def main():
     sys.stdout.flush()
 
     # ── Train / val split (within members) ────────────────────────────────────
-    n_val   = int(len(member_df) * VAL_FRACTION)
+    n_val    = int(len(member_df) * VAL_FRACTION)
     shuffled = member_df.sample(frac=1.0, random_state=RANDOM_SEED).reset_index(drop=True)
     val_df   = shuffled.iloc[:n_val].reset_index(drop=True)
     train_df = shuffled.iloc[n_val:].reset_index(drop=True)
@@ -282,18 +310,26 @@ def main():
     val_ds       = NIHDataset(val_df)                             # always plain
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=pin,
+        num_workers=4, pin_memory=pin, persistent_workers=True,
     )
     val_loader   = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=4, pin_memory=pin,
+        num_workers=4, pin_memory=pin, persistent_workers=True,
     )
+
+    # ── pos_weight for class imbalance ─────────────────────────────────────────
+    # Without pos_weight, the model collapses to all-zero predictions.
+    # This is the root cause of ~50% effective accuracy — element-wise accuracy
+    # LOOKS high but the model never predicts any positive label.
+    pos_weight = compute_pos_weight(train_df, num_classes).to(device)
+    print(f"[INFO] pos_weight (first 5): {pos_weight[:5].cpu().numpy().round(2)}")
 
     # ── Model, optimizer, criterion ───────────────────────────────────────────
     weight_decay = 1e-4 if is_regularized else 0.0
     model        = build_model(args.arch, num_classes, regularized=is_regularized).to(device)
     optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=weight_decay)
-    criterion    = nn.BCEWithLogitsLoss()
+    # Use pos_weight to balance the loss; this is the KEY fix for the 50% accuracy issue
+    criterion    = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     if is_regularized:
         print(f"[INFO] Regularisation: Dropout(0.3) + weight_decay={weight_decay} + augmentation")
@@ -301,9 +337,16 @@ def main():
         print("[INFO] Regularisation: NONE (intentional overfitting)")
     sys.stdout.flush()
 
+    # ── CSV log setup ─────────────────────────────────────────────────────────
+    csv_file   = open(log_csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(
+        ["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_auc", "gap_pct", "elapsed_s"]
+    )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     print("\n[TRAIN] Starting training …", flush=True)
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "val_auc": []}
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -318,6 +361,8 @@ def main():
             logits = model(images)
             loss   = criterion(logits, labels)
             loss.backward()
+            # Gradient clipping — prevents NaN in DenseNet with high LR
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             epoch_loss    += loss.item() * images.size(0)
@@ -327,7 +372,7 @@ def main():
 
         train_loss = epoch_loss / (epoch_n / num_classes)
         train_acc  = epoch_correct / epoch_n
-        val_loss, val_acc = evaluate(model, val_loader, device, num_classes)
+        val_loss, val_acc, val_auc = evaluate(model, val_loader, device, num_classes, criterion)
         gap_pct    = (train_acc - val_acc) * 100
         elapsed    = time.time() - t0
 
@@ -335,21 +380,31 @@ def main():
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
+        history["val_auc"].append(val_auc)
 
         print(
             f"  Epoch {epoch:02d}/{args.epochs}  "
             f"train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "
             f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}  "
-            f"gap={gap_pct:+.2f}%  ({elapsed:.1f}s)",
+            f"val_auc={val_auc:.4f}  gap={gap_pct:+.2f}%  ({elapsed:.1f}s)",
             flush=True,
         )
+        csv_writer.writerow(
+            [epoch, round(train_loss, 6), round(train_acc, 6),
+             round(val_loss, 6), round(val_acc, 6), round(val_auc, 6),
+             round(gap_pct, 4), round(elapsed, 2)]
+        )
+        csv_file.flush()
         sys.stdout.flush()
+
+    csv_file.close()
 
     # ── Save model + metadata ─────────────────────────────────────────────────
     torch.save(model.state_dict(), model_path)
 
     final_train_acc  = history["train_acc"][-1]
     final_val_acc    = history["val_acc"][-1]
+    final_val_auc    = history["val_auc"][-1]
     memorization_gap = final_train_acc - final_val_acc
 
     meta = {
@@ -362,6 +417,7 @@ def main():
         "imagenet_std":     IMAGENET_STD,
         "final_train_acc":  final_train_acc,
         "final_val_acc":    final_val_acc,
+        "final_val_auc":    final_val_auc,
         "memorization_gap": memorization_gap,
         "epochs":           args.epochs,
         "batch_size":       args.batch_size,
@@ -369,16 +425,47 @@ def main():
         "weight_decay":     1e-4 if is_regularized else 0.0,
         "dropout":          is_regularized,
         "augmentation":     is_regularized,
+        "pos_weight_used":  True,
+        "grad_clip":        5.0,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
+
+    # ── Human-readable summary log ────────────────────────────────────────────
+    with open(log_txt_path, "w") as f:
+        f.write(f"Victim Model Training Summary\n")
+        f.write(f"{'=' * 50}\n")
+        f.write(f"Mode:             {args.mode}\n")
+        f.write(f"Architecture:     {args.arch}\n")
+        f.write(f"Epochs:           {args.epochs}\n")
+        f.write(f"Batch size:       {args.batch_size}\n")
+        f.write(f"Learning rate:    {args.lr}\n")
+        f.write(f"Weight decay:     {meta['weight_decay']}\n")
+        f.write(f"Dropout:          {is_regularized}\n")
+        f.write(f"pos_weight:       True\n")
+        f.write(f"Gradient clip:    5.0\n\n")
+        f.write(f"Final train_acc:  {final_train_acc:.4f}\n")
+        f.write(f"Final val_acc:    {final_val_acc:.4f}\n")
+        f.write(f"Final val_AUC:    {final_val_auc:.4f}\n")
+        f.write(f"Memorization gap: {memorization_gap * 100:+.2f}%\n\n")
+        f.write(f"{'Epoch':>5}  {'TrLoss':>8}  {'TrAcc':>7}  {'VlLoss':>8}  {'VlAcc':>7}  {'VlAUC':>7}  {'Gap%':>6}\n")
+        f.write(f"{'-' * 60}\n")
+        for i, (tl, ta, vl, va, vc) in enumerate(zip(
+            history["train_loss"], history["train_acc"],
+            history["val_loss"],   history["val_acc"],   history["val_auc"]
+        ), start=1):
+            gap = (ta - va) * 100
+            f.write(f"  {i:3d}  {tl:8.4f}  {ta:7.4f}  {vl:8.4f}  {va:7.4f}  {vc:7.4f}  {gap:+6.2f}\n")
 
     print("\n[DONE]")
     print(f"  Mode:             {args.mode}")
     print(f"  Model:            {model_path}")
     print(f"  Metadata:         {meta_path}")
+    print(f"  Training log:     {log_csv_path}")
+    print(f"  Summary:          {log_txt_path}")
     print(f"  Final train_acc:  {final_train_acc:.4f}")
     print(f"  Final val_acc:    {final_val_acc:.4f}")
+    print(f"  Final val_AUC:    {final_val_auc:.4f}")
     print(f"  Memorization gap: {memorization_gap * 100:+.2f}%")
     sys.stdout.flush()
 

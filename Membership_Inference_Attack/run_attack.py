@@ -45,17 +45,31 @@ VICTIM_DIR   = os.path.join(PROJECT_ROOT, "Victim_Model")
 sys.path.insert(0, SCRIPT_DIR)   # mia.py, mia_variance.py, shadow_models.py
 sys.path.insert(0, VICTIM_DIR)   # api.py
 
-MANIFEST_PATH = os.path.join(VICTIM_DIR, "manifest.csv")
-RESULTS_PATH  = os.path.join(SCRIPT_DIR, "attack_results.txt")
+MANIFEST_PATH  = os.path.join(VICTIM_DIR, "manifest.csv")
+RESULTS_TXT    = os.path.join(SCRIPT_DIR, "attack_results.txt")
+RESULTS_JSON   = os.path.join(SCRIPT_DIR, "attack_results.json")
+LOGS_DIR       = os.path.join(SCRIPT_DIR, "logs")
 
 # ── Attack configuration ───────────────────────────────────────────────────────
+# NOTE on attacker's data model:
+#   The attacker has access to a large UNLABELLED pool of images drawn from the
+#   same distribution as the victim's training data — but does NOT know which
+#   specific images were used to train the victim.  We simulate this by mixing
+#   56k victim-members and 56k non-members, shuffling them, and giving the
+#   attacker the combined shuffled pool.  Shadow models are trained on random
+#   subsets of this pool, using victim API responses as pseudo-labels.
+#
+#   Pool sizes are set large (20k member + 20k non-member = 40k) to ensure the
+#   shadow models see enough data to mimic the victim's decision boundary.
+#   Shadow dataset size (10k/model) is ~18% of the victim's 56k training set —
+#   a realistic assumption for a capable attacker.
 
 NUM_SHADOW_MODELS   = 8
-SHADOW_DATASET_SIZE = 2_500    # images per shadow model
-NUM_POOL_MEMBERS    = 3_000
-NUM_POOL_NONMEMBERS = 3_000
-NUM_EVAL_MEMBERS    = 2_000
-NUM_EVAL_NONMEMBERS = 2_000
+SHADOW_DATASET_SIZE = 10_000   # images per shadow model (was 2,500 — too small)
+NUM_POOL_MEMBERS    = 20_000   # member images in attacker's pool (was 3,000)
+NUM_POOL_NONMEMBERS = 20_000   # non-member images in attacker's pool (was 3,000)
+NUM_EVAL_MEMBERS    = 5_000    # held-out evaluation set (was 2,000)
+NUM_EVAL_NONMEMBERS = 5_000
 RANDOM_SEED         = 42
 
 # Victim model variants — order determines table row order
@@ -99,11 +113,23 @@ def load_manifest():
 
 
 def build_pool_and_eval(member_paths_all, nonmember_paths_all):
-    """Return (pool_all, eval_member_paths, eval_nonmember_paths)."""
+    """Return (pool_all, eval_member_paths, eval_nonmember_paths).
+
+    Attacker's pool: a shuffled mix of member + non-member paths.
+    The attacker does NOT know which path belongs to which split.
+    The pool is drawn first; the remaining paths form the eval set
+    (which WE know the membership of, to score the attack).
+
+    Split logic:
+      pool_m  = min(NUM_POOL_MEMBERS,  len(members)  - NUM_EVAL_MEMBERS)
+      pool_nm = min(NUM_POOL_NONMEMBERS, len(nonmembers) - NUM_EVAL_NONMEMBERS)
+    This guarantees NUM_EVAL images are always reserved for evaluation.
+    """
     rng = np.random.RandomState(RANDOM_SEED)
 
-    max_pool_m  = int(len(member_paths_all)    * 0.66)
-    max_pool_nm = int(len(nonmember_paths_all) * 0.66)
+    # Reserve evaluation images first, use the rest for the pool
+    max_pool_m  = max(0, len(member_paths_all)    - NUM_EVAL_MEMBERS)
+    max_pool_nm = max(0, len(nonmember_paths_all) - NUM_EVAL_NONMEMBERS)
     n_pool_m    = min(NUM_POOL_MEMBERS,    max_pool_m)
     n_pool_nm   = min(NUM_POOL_NONMEMBERS, max_pool_nm)
 
@@ -118,18 +144,20 @@ def build_pool_and_eval(member_paths_all, nonmember_paths_all):
     eval_member_paths    = member_paths_all[member_idx[n_pool_m: n_pool_m + n_eval_m]]
     eval_nonmember_paths = nonmember_paths_all[nonmember_idx[n_pool_nm: n_pool_nm + n_eval_nm]]
 
+    # Shuffle the pool so shadow models can't infer membership from order
     pool_all = np.concatenate([pool_member_paths, pool_nonmember_paths])
     rng.shuffle(pool_all)
 
     print(
         f"\n[SETUP] Pool size:      {len(pool_all)} "
-        f"({n_pool_m} member + {n_pool_nm} nonmember, shuffled)"
+        f"({n_pool_m} member + {n_pool_nm} nonmember, shuffled — attacker cannot distinguish)"
     )
     print(f"[SETUP] Eval members:    {len(eval_member_paths)}")
     print(f"[SETUP] Eval nonmembers: {len(eval_nonmember_paths)}")
     sys.stdout.flush()
 
     return pool_all, eval_member_paths, eval_nonmember_paths
+
 
 
 def confidence_gap_diagnostic(api, eval_member_paths, eval_nonmember_paths):
@@ -164,16 +192,29 @@ def confidence_gap_diagnostic(api, eval_member_paths, eval_nonmember_paths):
     return gap
 
 
+# ─── Attack model variants to compare ─────────────────────────────────────────
+# Shadow models are trained ONCE; all attack models below reuse the same
+# attack dataset.  Add / remove entries here freely.
+
+ATTACK_MODELS = [
+    ("Gradient Boosting",   "gradient_boosting",   dict(n_estimators=200, learning_rate=0.05)),
+    ("Random Forest",       "random_forest",        dict(n_estimators=200)),
+    ("MLP",                 "mlp",                  dict(hidden_layer_sizes=(256, 128), max_iter=500)),
+    ("Logistic Regression", "logistic_regression",  dict()),   # linear baseline
+]
+
+
 # ─── Single-variant attack runners ────────────────────────────────────────────
 
 def run_baseline_attack(api, pool_paths, eval_member_paths,
-                        eval_nonmember_paths, num_classes: int) -> dict:
+                        eval_nonmember_paths, num_classes: int) -> list[dict]:
+    """Train shadow models ONCE, then evaluate all ATTACK_MODELS on the same dataset."""
     from mia import MIA, ModelParameters
 
     shadow_params = [
         ModelParameters(
             "pytorch_cnn", architecture=arch, num_classes=num_classes,
-            epochs=15, batch_size=32, lr=1e-3,
+            epochs=25, batch_size=32, lr=1e-3,
         )
         for arch in ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     ]
@@ -184,27 +225,34 @@ def run_baseline_attack(api, pool_paths, eval_member_paths,
         num_shadow_models=NUM_SHADOW_MODELS,
         shadow_model_dataset_size=SHADOW_DATASET_SIZE,
         shadow_model_parameters=shadow_params,
-        attack_model_parameters=ModelParameters(
-            "gradient_boosting", n_estimators=100, learning_rate=0.1
-        ),
     )
-    mia.execute()
 
-    print("\n[EVAL] Evaluating on held-out data …", flush=True)
-    metrics = mia.evaluate(eval_member_paths, eval_nonmember_paths)
-    _print_metrics("Baseline Shadow MIA", metrics)
-    return metrics
+    # ── Step 1 + 2: train shadows + build attack dataset (once) ───────────────
+    mia.execute_shadow_phase()
+
+    # ── Step 3: evaluate every attack model on the SAME dataset ───────────────
+    print("\n[EVAL] Evaluating all attack models on held-out data …", flush=True)
+    results = []
+    for label, model_type, kwargs in ATTACK_MODELS:
+        params  = ModelParameters(model_type, **kwargs)
+        metrics = mia.evaluate_attack_model(params, eval_member_paths, eval_nonmember_paths)
+        metrics["attack_label"] = f"Baseline / {label}"
+        _print_metrics(f"Baseline / {label}", metrics)
+        results.append(metrics)
+
+    return results
 
 
 def run_variance_attack(api, pool_paths, eval_member_paths,
-                        eval_nonmember_paths, num_classes: int) -> dict:
+                        eval_nonmember_paths, num_classes: int) -> list[dict]:
+    """Train shadow models ONCE, then evaluate all ATTACK_MODELS on the 16-dim dataset."""
     from mia_variance import VarianceMIA
     from mia import ModelParameters
 
     shadow_params = [
         ModelParameters(
             "pytorch_cnn", architecture=arch, num_classes=num_classes,
-            epochs=15, batch_size=32, lr=1e-3,
+            epochs=25, batch_size=32, lr=1e-3,
         )
         for arch in ["resnet18", "mobilenet_v3_small", "efficientnet_b0"]
     ]
@@ -215,19 +263,25 @@ def run_variance_attack(api, pool_paths, eval_member_paths,
         num_shadow_models=NUM_SHADOW_MODELS,
         shadow_model_dataset_size=SHADOW_DATASET_SIZE,
         shadow_model_parameters=shadow_params,
-        attack_model_parameters=ModelParameters(
-            "gradient_boosting", n_estimators=100, learning_rate=0.1
-        ),
     )
-    vmia.execute()
+
+    # ── Step 1 + 2: train shadows + build 16-dim attack dataset (once) ────────
+    vmia.execute_shadow_phase()
 
     print("\n  Attack dataset sample (first 3 rows):")
     print(vmia.attack_dataset.head(3).to_string(index=False))
 
-    print("\n[EVAL] Evaluating on held-out data …", flush=True)
-    metrics = vmia.evaluate(eval_member_paths, eval_nonmember_paths)
-    _print_metrics("Variance-Enhanced MIA", metrics)
-    return metrics
+    # ── Step 3: evaluate every attack model on the SAME dataset ───────────────
+    print("\n[EVAL] Evaluating all attack models on held-out data …", flush=True)
+    results = []
+    for label, model_type, kwargs in ATTACK_MODELS:
+        params  = ModelParameters(model_type, **kwargs)
+        metrics = vmia.evaluate_attack_model(params, eval_member_paths, eval_nonmember_paths)
+        metrics["attack_label"] = f"Variance / {label}"
+        _print_metrics(f"Variance / {label}", metrics)
+        results.append(metrics)
+
+    return results
 
 
 def _print_metrics(label: str, metrics: dict):
@@ -243,7 +297,11 @@ def _print_metrics(label: str, metrics: dict):
 
 def run_experiments_for_victim(variant: dict, pool_all, eval_member_paths,
                                eval_nonmember_paths) -> list[dict]:
-    """Run both attacks against one victim model. Returns list of result dicts."""
+    """Run baseline + variance attacks against one victim model.
+
+    Shadow models for each attack type are trained ONCE.
+    All ATTACK_MODELS are evaluated on the same attack dataset.
+    """
     from api import VictimAPI
 
     model_path = variant["model_path"]
@@ -267,11 +325,19 @@ def run_experiments_for_victim(variant: dict, pool_all, eval_member_paths,
     print(f"  Architecture:    {meta.get('architecture', '?')}")
     print(f"  train_acc:       {meta.get('final_train_acc', 0):.4f}")
     print(f"  val_acc:         {meta.get('final_val_acc', 0):.4f}")
+    print(f"  val_AUC:         {meta.get('final_val_auc', 0):.4f}")
     print(f"  Memorization gap:{meta.get('memorization_gap', 0) * 100:+.2f}%")
     print(f"  Dropout:         {meta.get('dropout', False)}")
     print(f"  Weight decay:    {meta.get('weight_decay', 0.0)}")
-    print(f"  Augmentation:    {meta.get('augmentation', False)}")
+    print(f"  pos_weight:      {meta.get('pos_weight_used', False)}")
     sys.stdout.flush()
+
+    victim_meta_snapshot = {
+        k: v for k, v in meta.items()
+        if k not in ("imagenet_mean", "imagenet_std", "label_names")
+    }
+
+    results = []
 
     api = VictimAPI(model_path, num_classes=num_classes, batch_size=32)
     print(f"\n  Inference device: {api.device}", flush=True)
@@ -279,35 +345,87 @@ def run_experiments_for_victim(variant: dict, pool_all, eval_member_paths,
     print("\n  Pre-computing confidence-gap diagnostic …", flush=True)
     gap = confidence_gap_diagnostic(api, eval_member_paths, eval_nonmember_paths)
 
-    results = []
-
-    # --- Attack 1: Baseline ---
+    # ── Attack 1: Baseline (all ATTACK_MODELS on same shadow dataset) ─────────
     print_banner(f"[{label}] ATTACK 1: STANDARD SHADOW MODEL MIA")
-    t0       = time.time()
-    metrics1 = run_baseline_attack(api, pool_all, eval_member_paths,
-                                   eval_nonmember_paths, num_classes)
-    results.append({
-        "victim_label":  label,
-        "attack_label":  "Baseline (Gradient Boosting)",
-        "conf_gap":      gap,
-        **metrics1,
-    })
-    print(f"  Runtime: {time.time() - t0:.1f}s", flush=True)
+    t0    = time.time()
+    rows1 = run_baseline_attack(api, pool_all, eval_member_paths,
+                                eval_nonmember_paths, num_classes)
+    for r in rows1:
+        r["victim_label"] = label
+        r["conf_gap"]     = gap
+        r["mia_type"]     = "Baseline"
+        r["victim_meta"]  = victim_meta_snapshot
+    results.extend(rows1)
+    print(f"\n  Baseline total runtime: {time.time() - t0:.1f}s", flush=True)
 
-    # --- Attack 2: Variance ---
+    # ── Attack 2: Variance (all ATTACK_MODELS on same 16-dim dataset) ─────────
     print_banner(f"[{label}] ATTACK 2: VARIANCE-ENHANCED SHADOW MIA")
-    t0       = time.time()
-    metrics2 = run_variance_attack(api, pool_all, eval_member_paths,
-                                   eval_nonmember_paths, num_classes)
-    results.append({
-        "victim_label":  label,
-        "attack_label":  "Variance-Enhanced (Gradient Boosting)",
-        "conf_gap":      gap,
-        **metrics2,
-    })
-    print(f"  Runtime: {time.time() - t0:.1f}s", flush=True)
+    t0    = time.time()
+    rows2 = run_variance_attack(api, pool_all, eval_member_paths,
+                                eval_nonmember_paths, num_classes)
+    for r in rows2:
+        r["victim_label"] = label
+        r["conf_gap"]     = gap
+        r["mia_type"]     = "Variance"
+        r["victim_meta"]  = victim_meta_snapshot
+    results.extend(rows2)
+    print(f"\n  Variance total runtime: {time.time() - t0:.1f}s", flush=True)
 
     return results
+
+
+def _save_results(all_results: list, total_time: float):
+    """Write full results to attack_results.txt (human) and attack_results.json."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    VL = 34
+    AL = 38
+
+    # ── Text file ────────────────────────────────────────────────────────────
+    with open(RESULTS_TXT, "w") as f:
+        f.write("NIH Chest X-ray — MIA Results (Overfit vs Regularized)\n")
+        f.write("=" * 90 + "\n\n")
+        f.write(
+            f"  {'Victim Model':<{VL}}  {'Attack':<{AL}}  "
+            f"{'Gap':>7}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}\n"
+        )
+        f.write("  " + "-" * 88 + "\n")
+        for r in all_results:
+            f.write(
+                f"  {r['victim_label']:<{VL}}  {r['attack_label']:<{AL}}  "
+                f"{r['conf_gap']:+7.4f}  {r['accuracy']:7.4f}  "
+                f"{r['precision']:7.4f}  {r['recall']:7.4f}  {r['f1']:7.4f}\n"
+            )
+        f.write(f"\nRandom baseline: 0.5000\n")
+        f.write(f"Total runtime:   {total_time:.1f}s\n")
+
+        # Per-victim metadata block
+        f.write("\n" + "=" * 90 + "\n")
+        f.write("Victim Model Details\n")
+        f.write("=" * 90 + "\n")
+        seen = set()
+        for r in all_results:
+            vl = r["victim_label"]
+            if vl not in seen:
+                seen.add(vl)
+                f.write(f"\n  {vl}\n")
+                vm = r.get("victim_meta", {})
+                for k, v in vm.items():
+                    f.write(f"    {k:<25s}: {v}\n")
+
+    # ── JSON file ────────────────────────────────────────────────────────────
+    with open(RESULTS_JSON, "w") as f:
+        json.dump(
+            {
+                "total_runtime_s": round(total_time, 2),
+                "random_baseline": 0.5,
+                "results": all_results,
+            },
+            f, indent=2,
+        )
+
+    print(f"\n  Results (TXT): {RESULTS_TXT}", flush=True)
+    print(f"  Results (JSON): {RESULTS_JSON}", flush=True)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -349,6 +467,9 @@ def main():
             variant, pool_all, eval_member_paths, eval_nonmember_paths
         )
         all_results.extend(results)
+        # Incremental save after each victim so a crash doesn't lose completed results
+        if all_results:
+            _save_results(all_results, time.time() - grand_start)
 
     total_time = time.time() - grand_start
 
@@ -364,15 +485,15 @@ def main():
 
     header = (
         f"\n  {'Victim Model':<{VL}}  {'Attack':<{AL}}  "
-        f"{'Gap':>6}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}"
+        f"{'Gap':>7}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}"
     )
     print(header)
-    print("  " + "-" * (VL + AL + 50))
+    print("  " + "-" * 88)
 
     for r in all_results:
         print(
             f"  {r['victim_label']:<{VL}}  {r['attack_label']:<{AL}}  "
-            f"{r['conf_gap']:+6.4f}  {r['accuracy']:7.4f}  "
+            f"{r['conf_gap']:+7.4f}  {r['accuracy']:7.4f}  "
             f"{r['precision']:7.4f}  {r['recall']:7.4f}  {r['f1']:7.4f}"
         )
 
@@ -380,25 +501,8 @@ def main():
     print(f"  Total runtime:   {total_time:.1f}s")
     sys.stdout.flush()
 
-    # 6. Save to file
-    with open(RESULTS_PATH, "w") as f:
-        f.write("NIH Chest X-ray — MIA Results (Overfit vs Regularized)\n")
-        f.write("=" * 75 + "\n\n")
-        f.write(
-            f"  {'Victim Model':<{VL}}  {'Attack':<{AL}}  "
-            f"{'Gap':>6}  {'Acc':>7}  {'Prec':>7}  {'Rec':>7}  {'F1':>7}\n"
-        )
-        f.write("  " + "-" * (VL + AL + 50) + "\n")
-        for r in all_results:
-            f.write(
-                f"  {r['victim_label']:<{VL}}  {r['attack_label']:<{AL}}  "
-                f"{r['conf_gap']:+6.4f}  {r['accuracy']:7.4f}  "
-                f"{r['precision']:7.4f}  {r['recall']:7.4f}  {r['f1']:7.4f}\n"
-            )
-        f.write(f"\nRandom baseline: 0.5000\n")
-        f.write(f"Total runtime:   {total_time:.1f}s\n")
-
-    print(f"\n  Results saved to: {RESULTS_PATH}", flush=True)
+    # 6. Final save
+    _save_results(all_results, total_time)
 
 
 if __name__ == "__main__":

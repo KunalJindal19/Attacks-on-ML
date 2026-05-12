@@ -183,6 +183,81 @@ class VarianceMIA(MIA):
         )
 
     # ------------------------------------------------------------------
+    # execute() override: use shadow phase split
+    # ------------------------------------------------------------------
+    def execute(self) -> "VarianceMIA":
+        """Full pipeline. Calls execute_shadow_phase then trains one attack model."""
+        self.execute_shadow_phase()
+        print("[VarianceMIA] Training attack model …", flush=True)
+        self._train_attack_model()
+        self._is_trained = True
+        print("[VarianceMIA] Pipeline complete ✓", flush=True)
+        return self
+
+    def execute_shadow_phase(self) -> "VarianceMIA":
+        """Steps 1 + 2 only: train shadow models and build attack dataset.
+
+        Call ONCE, then call evaluate_attack_model() for each attack model
+        variant without re-training shadows.
+        """
+        print("[VarianceMIA] Step 1/2: Training shadow models …", flush=True)
+        self._train_shadow_models()
+        print("[VarianceMIA] Step 2/2: Preparing attack dataset (conf + variance) …", flush=True)
+        self._prepare_attack_dataset()
+        print("[VarianceMIA] Shadow phase complete ✓", flush=True)
+        return self
+
+    def evaluate_attack_model(
+        self,
+        attack_params: "ModelParameters",
+        member_data: np.ndarray,
+        non_member_data: np.ndarray,
+    ) -> dict:
+        """Train ONE attack model on the pre-built 16-dim dataset and evaluate it."""
+        if self.attack_dataset is None:
+            raise RuntimeError("Call execute_shadow_phase() before evaluate_attack_model().")
+
+        conf_cols    = [f"class_{c}" for c in range(self.num_classes)]
+        feature_cols = conf_cols + ["variance_of_max"]
+        X = self.attack_dataset[feature_cols].values
+        y = self.attack_dataset["is_part_of_dataset"].values
+
+        model = attack_params.build(random_state=self.random_state)
+        model.fit(X, y)
+        print(f"  Attack model trained: {attack_params.model_type} (16 features)", flush=True)
+
+        # Temporarily swap in this model for the attack() call
+        prev_model   = self.attack_model
+        prev_params  = self.attack_model_parameters
+        prev_trained = self._is_trained
+        self.attack_model            = model
+        self.attack_model_parameters = attack_params
+        self._is_trained             = True
+
+        X_eval = np.concatenate([member_data, non_member_data])
+        y_true = np.concatenate([
+            np.ones(len(member_data)),
+            np.zeros(len(non_member_data)),
+        ])
+        y_pred = self.attack(X_eval)
+
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        metrics = {
+            "attack_model": attack_params.model_type,
+            "accuracy":     accuracy_score(y_true, y_pred),
+            "precision":    precision_score(y_true, y_pred, zero_division=0),
+            "recall":       recall_score(y_true, y_pred, zero_division=0),
+            "f1":           f1_score(y_true, y_pred, zero_division=0),
+        }
+
+        # Restore previous state
+        self.attack_model            = prev_model
+        self.attack_model_parameters = prev_params
+        self._is_trained             = prev_trained
+
+        return metrics
+
+    # ------------------------------------------------------------------
     # Attack: victim confidence + cross-shadow variance → membership
     # ------------------------------------------------------------------
     def attack(self, data: np.ndarray, return_confidence: bool = False):

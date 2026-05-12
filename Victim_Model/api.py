@@ -73,6 +73,8 @@ class VictimAPI:
         self.architecture = meta.get("architecture", "densenet121")
         self.img_size     = int(meta.get("img_size", 224))
         self.label_names  = meta.get("label_names", [])
+        # Read dropout flag so _build_model reconstructs the EXACT same head
+        self.use_dropout  = bool(meta.get("dropout", False))
 
         # ── Device ─────────────────────────────────────────────────────────────
         self.device = torch.device(
@@ -98,36 +100,48 @@ class VictimAPI:
 
     # ------------------------------------------------------------------
     def _build_model(self) -> nn.Module:
-        """Reconstruct model architecture (must match train_victim.py)."""
+        """Reconstruct model architecture exactly as it was in train_victim.py.
+
+        The head structure depends on whether the model was trained with dropout:
+          overfit mode:     Linear → ReLU → Linear           (keys: .0 .2)
+          regularized mode: Linear → ReLU → Dropout → Linear (keys: .0 .2 .3)
+        Dropout has no learnable params but shifts the Sequential index of the
+        final Linear layer, causing a state_dict key mismatch if omitted.
+        """
         arch = self.architecture.lower()
         nc   = self.num_classes
+
+        if self.use_dropout:
+            head = nn.Sequential(
+                nn.Linear(512, 512),   # placeholder — in_f filled below
+                nn.ReLU(),
+                nn.Dropout(p=0.3),
+                nn.Linear(512, nc),
+            )
+        else:
+            head = nn.Sequential(
+                nn.Linear(512, 512),   # placeholder — in_f filled below
+                nn.ReLU(),
+                nn.Linear(512, nc),
+            )
 
         if arch == "densenet121":
             model = models.densenet121(weights=None)
             in_f  = model.classifier.in_features
-            model.classifier = nn.Sequential(
-                nn.Linear(in_f, 512),
-                nn.ReLU(),
-                nn.Linear(512, nc),
-            )
+            head[0] = nn.Linear(in_f, 512)
+            model.classifier = head
 
         elif arch == "resnet50":
             model = models.resnet50(weights=None)
             in_f  = model.fc.in_features
-            model.fc = nn.Sequential(
-                nn.Linear(in_f, 512),
-                nn.ReLU(),
-                nn.Linear(512, nc),
-            )
+            head[0] = nn.Linear(in_f, 512)
+            model.fc = head
 
         elif arch == "efficientnet_b3":
             model = models.efficientnet_b3(weights=None)
             in_f  = model.classifier[1].in_features
-            model.classifier = nn.Sequential(
-                nn.Linear(in_f, 512),
-                nn.ReLU(),
-                nn.Linear(512, nc),
-            )
+            head[0] = nn.Linear(in_f, 512)
+            model.classifier = head
 
         else:
             raise ValueError(
