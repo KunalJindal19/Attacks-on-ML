@@ -25,12 +25,13 @@ images are skipped automatically.
 
 import os
 import sys
+import time
 import zipfile
 import shutil
 import argparse
-import urllib.request
 from collections import Counter
 
+import requests
 import numpy as np
 import pandas as pd
 
@@ -68,31 +69,123 @@ RANDOM_SEED  = 42
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+# Download constants
+CHUNK_SIZE  = 8 * 1024 * 1024   # 8 MB write chunks
+MAX_RETRIES = 5                  # attempts before giving up
+BACKOFF_BASE = 5                 # seconds — wait = BACKOFF_BASE * 2^attempt
+
+
 def _download(url: str, dest: str):
-    """Download *url* to *dest* with a simple progress bar. Skips if present."""
-    if os.path.exists(dest):
-        mb = os.path.getsize(dest) / 1_048_576
-        print(f"  Already present: {os.path.basename(dest)} ({mb:.1f} MB) — skipping.")
-        return
+    """Download *url* to *dest* with resume support and retry on failure.
 
-    print(f"  Downloading: {url}")
-    print(f"          ->: {dest}")
+    - If *dest* already exists AND its size matches Content-Length, skips.
+    - If *dest* is a partial file (previous interrupted download), resumes
+      from its current byte offset using an HTTP Range request.
+    - On connection errors, retries up to MAX_RETRIES times with exponential
+      backoff before raising.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            # -- Check how many bytes we already have (resume offset) ----------
+            existing_bytes = os.path.getsize(dest) if os.path.exists(dest) else 0
+            headers = {}
+            if existing_bytes > 0:
+                headers["Range"] = f"bytes={existing_bytes}-"
 
-    last_pct = [-1]
+            resp = requests.get(url, headers=headers, stream=True, timeout=60)
 
-    def _hook(block_num, block_size, total_size):
-        if total_size <= 0:
-            return
-        downloaded = block_num * block_size
-        pct = min(100, int(downloaded * 100 / total_size))
-        if pct != last_pct[0] and pct % 5 == 0:
-            mb_done  = downloaded   / 1_048_576
-            mb_total = total_size   / 1_048_576
-            print(f"    {pct:3d}%  ({mb_done:7.1f} / {mb_total:7.1f} MB)", flush=True)
-            last_pct[0] = pct
+            # 416 = Range Not Satisfiable → file already fully downloaded
+            if resp.status_code == 416:
+                print(
+                    f"  Already fully downloaded: {os.path.basename(dest)} "
+                    f"({existing_bytes / 1_048_576:.1f} MB) — skipping."
+                )
+                return
 
-    urllib.request.urlretrieve(url, dest, reporthook=_hook)
-    print(f"  Done: {os.path.getsize(dest) / 1_048_576:.1f} MB", flush=True)
+            resp.raise_for_status()
+
+            # -- Determine total expected size ---------------------------------
+            content_length = int(resp.headers.get("Content-Length", 0))
+            total_bytes    = existing_bytes + content_length
+
+            # If server returned 200 (doesn't support Range), restart fully
+            if resp.status_code == 200 and existing_bytes > 0:
+                print(
+                    f"  Server does not support resume — restarting download of "
+                    f"{os.path.basename(dest)}."
+                )
+                existing_bytes = 0
+
+            # If file is already complete, skip
+            if existing_bytes > 0 and content_length == 0:
+                print(
+                    f"  Already present: {os.path.basename(dest)} "
+                    f"({existing_bytes / 1_048_576:.1f} MB) — skipping."
+                )
+                return
+
+            # -- Open file in append (resume) or write (fresh) mode -----------
+            mode = "ab" if existing_bytes > 0 else "wb"
+            verb = f"Resuming from {existing_bytes / 1_048_576:.1f} MB" \
+                   if existing_bytes > 0 else "Downloading"
+            print(f"  {verb}: {url}")
+            print(f"      -> {dest}")
+            if total_bytes:
+                print(
+                    f"     Total: {total_bytes / 1_048_576:.1f} MB",
+                    flush=True,
+                )
+
+            downloaded = existing_bytes
+            last_pct   = -1
+
+            with open(dest, mode) as fh:
+                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total_bytes:
+                        pct = min(100, int(downloaded * 100 / total_bytes))
+                        if pct != last_pct and pct % 5 == 0:
+                            print(
+                                f"    {pct:3d}%  "
+                                f"({downloaded / 1_048_576:7.1f} / "
+                                f"{total_bytes / 1_048_576:7.1f} MB)",
+                                flush=True,
+                            )
+                            last_pct = pct
+
+            # -- Verify final size --------------------------------------------
+            final_size = os.path.getsize(dest)
+            if total_bytes and final_size < total_bytes:
+                raise IOError(
+                    f"Incomplete download: expected {total_bytes} bytes, "
+                    f"got {final_size} bytes."
+                )
+
+            print(
+                f"  Done: {final_size / 1_048_576:.1f} MB — "
+                f"{os.path.basename(dest)}",
+                flush=True,
+            )
+            return   # success
+
+        except (requests.RequestException, IOError, OSError) as exc:
+            wait = BACKOFF_BASE * (2 ** attempt)
+            if attempt + 1 < MAX_RETRIES:
+                print(
+                    f"  WARNING: Download error on attempt {attempt + 1}/{MAX_RETRIES}: {exc}"
+                    f"  Retrying in {wait}s …",
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                print(
+                    f"  ERROR: Download failed after {MAX_RETRIES} attempts: {exc}",
+                    flush=True,
+                )
+                raise
 
 
 def _extract_zip(zip_path: str, images_dir: str):
